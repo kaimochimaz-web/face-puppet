@@ -75,7 +75,13 @@ function buildAvatar(image,w,h,mask){
  fgctx.globalCompositeOperation='destination-in';fgctx.drawImage(scaled,0,0);fgctx.globalCompositeOperation='source-over';
  avatar={w:fg.width,h:fg.height};dx=dy=0;neutral=null;baseline=null;render();
 }
-$('backgroundFile').addEventListener('change',async e=>{\n const file=e.target.files?.[0];if(!file)return;\n try{const bmp=await createImageBitmap(file);const clean=document.createElement('canvas');clean.width=canvas.width;clean.height=canvas.height;clean.getContext('2d').drawImage(bmp,0,0,clean.width,clean.height);bg=clean;render();say('Clean background loaded. Choose an image without the person, with matching framing, to prevent a duplicate.');}\n catch(err){say('Could not load background: '+(err.message||err),true)}\n});\n$('clearBackground').onclick=()=>{bg=null;$('backgroundFile').value='';render();say('Using original photo background. The person may appear twice when the cut-out moves.');};\n$('file').addEventListener('change',async e=>{
+$('backgroundFile').addEventListener('change',async e=>{
+ const file=e.target.files?.[0];if(!file)return;
+ try{const bmp=await createImageBitmap(file);const clean=document.createElement('canvas');clean.width=canvas.width;clean.height=canvas.height;clean.getContext('2d').drawImage(bmp,0,0,clean.width,clean.height);bg=clean;render();say('Clean background loaded. Choose an image without the person, with matching framing, to prevent a duplicate.');}
+ catch(err){say('Could not load background: '+(err.message||err),true)}
+});
+$('clearBackground').onclick=()=>{bg=null;$('backgroundFile').value='';render();say('Using original photo background. The person may appear twice when the cut-out moves.');};
+$('file').addEventListener('change',async e=>{
  const file=e.target.files?.[0];if(!file)return;
  try{
   await init();say('Preparing avatar and separating the person from the background…');
