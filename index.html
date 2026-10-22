@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<title>Body Puppet — KaiCamp prototype</title>
+<style>
+:root{color-scheme:dark;--bg:#0e1116;--panel:#171c24;--ink:#e9edf2;--mute:#9aa5b5;--acc:#3ddc97;--err:#ff7a7a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,sans-serif;min-height:100dvh;display:flex;flex-direction:column}
+#stage{flex:1;min-height:42vh;display:flex;align-items:center;justify-content:center;padding:8px;position:relative}
+canvas{display:block;max-width:100%;max-height:64dvh;width:auto;height:auto;background:#171c24;border-radius:14px}
+#cam{position:absolute;right:14px;bottom:14px;width:86px;max-height:120px;object-fit:cover;display:none;transform:scaleX(-1);border:2px solid var(--acc);border-radius:10px}
+#msg{padding:8px 14px;min-height:38px;text-align:center;font-size:13px;color:var(--mute)}#msg.err{color:var(--err)}
+.panel{padding:8px 12px calc(14px + env(safe-area-inset-bottom));display:grid;gap:8px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button,label.btn{display:flex;align-items:center;justify-content:center;min-height:48px;background:var(--acc);color:#06210f;border:0;border-radius:12px;padding:12px 8px;font:600 15px system-ui,sans-serif;text-align:center}
+button.alt,label.btn.alt{background:var(--panel);color:var(--ink);border:1px solid #2b3340}
+button:disabled{opacity:.5}input[type=file]{display:none}
+.sl{display:grid;grid-template-columns:110px 1fr;align-items:center;gap:8px;color:var(--mute);font-size:13px}
+input[type=range]{width:100%;accent-color:var(--acc)}
+.note{font-size:12px;color:var(--mute);line-height:1.45;padding:0 4px}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="out" width="720" height="960" aria-label="Body Puppet preview"></canvas><video id="cam" playsinline muted></video></div>
+<div id="msg">Choose a clear photo, then start the camera. Keep your head and shoulders visible.</div>
+<div class="panel">
+ <div class="row"><label class="btn">Choose avatar photo<input id="file" type="file" accept="image/*"></label><button id="start">Start camera</button></div>
+ <div class="row"><button id="cal" class="alt">Calibrate neutral pose</button><button id="save" class="alt">Record video</button></div>
+ <label class="sl">Movement<input id="sens" type="range" min=".3" max="2.5" step=".1" value="1"></label>
+ <label class="sl">Body follow<input id="body" type="range" min="0" max="1" step=".05" value=".7"></label>
+ <label class="sl">Smoothing<input id="smooth" type="range" min="0" max=".9" step=".05" value=".45"></label>
+ <div class="note">Prototype limitation: the background is kept still and the segmented person moves as one cut-out. This version does not yet independently animate facial expressions, limbs, or lip-sync. Use a clear photo with one visible person; internet is required to load the tracking models.</div>
+</div>
+<script type="module">
+import {FaceLandmarker,PoseLandmarker,ImageSegmenter,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const BASE="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const FACE="https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const POSE="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+const SEG="https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite";
+const $=id=>document.getElementById(id), canvas=$('out'),ctx=canvas.getContext('2d',{alpha:false}),cam=$('cam'),msg=$('msg');
+const say=(s,err=false)=>{msg.textContent=s;msg.className=err?'err':''};
+let face,pose,segmenter,ready=false,avatar=null,cutout=null,bg=null,maskCanvas=null,neutral=null,baseline=null,dx=0,dy=0,rec=null,chunks=[],lastTime=-1,raf=0;
+const src=document.createElement('canvas'),fg=document.createElement('canvas'),fgctx=fg.getContext('2d'),bctx=src.getContext('2d'),mctx= document.createElement('canvas').getContext('2d');
+async function init(){
+ if(ready)return;
+ say('Loading face, body and background-removal models… first load needs internet.');
+ const vision=await FilesetResolver.forVisionTasks(BASE+'/wasm');
+ const make=async(C,model,opts={})=>{try{return await C.createFromOptions(vision,{baseOptions:{modelAssetPath:model,delegate:'GPU'},runningMode:'VIDEO',...opts})}catch(e){return await C.createFromOptions(vision,{baseOptions:{modelAssetPath:model,delegate:'CPU'},runningMode:'VIDEO',...opts})}};
+ face=await make(FaceLandmarker,FACE,{numFaces:1});
+ pose=await make(PoseLandmarker,POSE,{numPoses:1});
+ segmenter=await make(ImageSegmenter,SEG,{outputConfidenceMasks:true,outputCategoryMask:false});
+ ready=true;
+}
+function sizeCanvas(w,h){
+ const s=Math.min(1,900/Math.max(w,h));const W=Math.max(2,Math.round(w*s)),H=Math.max(2,Math.round(h*s));
+ canvas.width=W;canvas.height=H;src.width=W;src.height=H;fg.width=W;fg.height=H;
+ canvas.style.aspectRatio=W+'/'+H;
+}
+function buildAvatar(image,w,h,mask){
+ sizeCanvas(w,h);
+ bctx.clearRect(0,0,src.width,src.height);bctx.drawImage(image,0,0,src.width,src.height);
+ fgctx.clearRect(0,0,fg.width,fg.height);fgctx.drawImage(image,0,0,fg.width,fg.height);
+ const masks=mask.confidenceMasks;
+ if(!masks||!masks.length)throw new Error('The segmentation model did not return a person mask.');
+ const mw=masks[0].width,mh=masks[0].height,vals=masks[0].getAsFloat32Array();
+ const mc=document.createElement('canvas');mc.width=mw;mc.height=mh;
+ const mx=mc.getContext('2d'),im=mx.createImageData(mw,mh);
+ for(let i=0;i<vals.length;i++){const a=Math.max(0,Math.min(255,Math.round(vals[i]*255)));const j=i*4;im.data[j]=255;im.data[j+1]=255;im.data[j+2]=255;im.data[j+3]=a}
+ mx.putImageData(im,0,0);
+ const scaled=document.createElement('canvas');scaled.width=fg.width;scaled.height=fg.height;
+ scaled.getContext('2d').drawImage(mc,0,0,scaled.width,scaled.height);
+ fgctx.globalCompositeOperation='destination-in';fgctx.drawImage(scaled,0,0);fgctx.globalCompositeOperation='source-over';
+ avatar={w:fg.width,h:fg.height};dx=dy=0;neutral=null;baseline=null;render();
+}
+$('file').addEventListener('change',async e=>{
+ const file=e.target.files?.[0];if(!file)return;
+ try{
+  await init();say('Preparing avatar and separating the person from the background…');
+  const bmp=await createImageBitmap(file);
+  const tmp=document.createElement('canvas'),scale=Math.min(1,900/Math.max(bmp.width,bmp.height));
+  tmp.width=Math.round(bmp.width*scale);tmp.height=Math.round(bmp.height*scale);
+  tmp.getContext('2d').drawImage(bmp,0,0,tmp.width,tmp.height);
+  await segmenter.setOptions({runningMode:'IMAGE'});
+  let result;try{result=segmenter.segment(tmp)}finally{await segmenter.setOptions({runningMode:'VIDEO'})}
+  buildAvatar(tmp,tmp.width,tmp.height,result);
+  say('Avatar ready. Start the camera and hold a relaxed neutral pose.');
+ }catch(e){console.error(e);say('Could not prepare avatar: '+(e.message||e),true)}
+});
+$('start').onclick=async()=>{
+ try{
+  if(!avatar){say('Choose an avatar photo first.',true);return}
+  await init();
+  const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:'user',width:{ideal:640},height:{ideal:480}}});
+  cam.srcObject=stream;await cam.play();cam.style.display='block';neutral=null;baseline=null;lastTime=-1;
+  say('Camera is on. Keep your head and shoulders visible; tracking is starting.');
+ }catch(e){say(e.name==='NotAllowedError'?'Camera permission was denied. Allow camera access in your browser settings.':'Could not start camera: '+e.message,true)}
+};
+$('cal').onclick=()=>{neutral=null;baseline=null;dx=dy=0;say('Calibration reset. Hold your relaxed pose for a moment.')};
+function render(){
+ if(!avatar)return;
+ ctx.clearRect(0,0,canvas.width,canvas.height);
+ // The background is drawn once in its original position; only the masked person cut-out is translated.
+ ctx.drawImage(src,0,0);
+ ctx.drawImage(fg,dx,dy);
+}
+function track(){
+ if(avatar&&cam.readyState>=2&&cam.currentTime!==lastTime){
+  lastTime=cam.currentTime;const now=performance.now();
+  try{
+   const fr=face.detectForVideo(cam,now),pr=pose.detectForVideo(cam,now+1);
+   const lm=fr.faceLandmarks?.[0],pl=pr.landmarks?.[0];
+   if(lm){
+    const x=lm.reduce((s,p)=>s+(1-p.x)*cam.videoWidth,0)/lm.length;
+    const y=lm.reduce((s,p)=>s+p.y*cam.videoHeight,0)/lm.length;
+    let px=x/cam.videoWidth*canvas.width,py=y/cam.videoHeight*canvas.height;
+    if(!neutral)neutral={x:px,y:py};
+    const factor=+$('sens').value,body=+$('body').value,sm=1-(+$('smooth').value);
+    let tx=(neutral.x-px)*factor,ty=(neutral.y-py)*factor;
+    if(pl){
+      const l=pl[11],r=pl[12];
+      if(l&&r&&(l.visibility??0)>.5&&(r.visibility??0)>.5){
+       const shx=((1-(l.x+r.x)/2)*cam.videoWidth)/cam.videoWidth*canvas.width;
+       const shy=((l.y+r.y)/2*cam.videoHeight)/cam.videoHeight*canvas.height;
+       if(!baseline)baseline={x:shx,y:shy};
+       tx+=(baseline.x-shx)*body;ty+=(baseline.y-shy)*body;
+      }
+    }
+    const limX=canvas.width*.22,limY=canvas.height*.22;
+    tx=Math.max(-limX,Math.min(limX,tx));ty=Math.max(-limY,Math.min(limY,ty));
+    dx+=sm*(tx-dx);dy+=sm*(ty-dy);
+    say('Tracking face'+(pl?' and body':'')+'. Background stays fixed; the avatar cut-out follows your movement.');
+   }else say('Face not detected. Face the camera and improve lighting.',true);
+  }catch(e){console.error(e);say('Tracking error: '+e.message,true)}
+ }
+ render();raf=requestAnimationFrame(track);
+}
+function stopCamera(){if(cam.srcObject)cam.srcObject.getTracks().forEach(t=>t.stop());cam.srcObject=null;cam.style.display='none'}
+raf=requestAnimationFrame(track);
+$('save').onclick=()=>{
+ const b=$('save');
+ if(rec&&rec.state==='recording'){rec.stop();return}
+ if(!avatar||!canvas.captureStream||!window.MediaRecorder){say('Recording is not supported in this browser or no avatar is loaded.',true);return}
+ try{
+  const stream=canvas.captureStream(24),type=['video/mp4','video/webm;codecs=vp9','video/webm'].find(t=>MediaRecorder.isTypeSupported(t));
+  rec=new MediaRecorder(stream,type?{mimeType:type}:{});chunks=[];
+  rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+  rec.onstop=()=>{const blob=new Blob(chunks,{type:rec.mimeType}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='body-puppet.'+(rec.mimeType.includes('mp4')?'mp4':'webm');a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);b.textContent='Record video';b.className='alt';say('Recording saved if your browser accepted the download.');stream.getTracks().forEach(t=>t.stop())};
+  rec.start();b.textContent='Stop and save';b.className='';
+ }catch(e){say('Could not record: '+e.message,true)}
+};
+window.addEventListener('pagehide',()=>{stopCamera();if(raf)cancelAnimationFrame(raf)});
+</script>
+</body>
+</html>
