@@ -119,9 +119,12 @@ function track(){
    const fr=face.detectForVideo(cam,now),pr=pose.detectForVideo(cam,now+1);
    const lm=fr.faceLandmarks?.[0],pl=pr.landmarks?.[0];
    if(lm){
-    const x=lm.reduce((s,p)=>s+(1-p.x)*cam.videoWidth,0)/lm.length;
-    const y=lm.reduce((s,p)=>s+p.y*cam.videoHeight,0)/lm.length;
-    let px=x/cam.videoWidth*canvas.width,py=y/cam.videoHeight*canvas.height;
+    // Use stable facial anchors (eyes, nose bridge and chin), not every mesh point.
+    // This reduces apparent jitter when the mouth or eyebrows move.
+    const ids=[33,263,1,152].map(i=>lm[i]).filter(Boolean);
+    const x=ids.reduce((s,p)=>s+(1-p.x)*cam.videoWidth,0)/ids.length;
+    const y=ids.reduce((s,p)=>s+p.y*cam.videoHeight,0)/ids.length;
+    const px=x/cam.videoWidth*canvas.width,py=y/cam.videoHeight*canvas.height;
     if(!neutral)neutral={x:px,y:py};
     const factor=+$('sens').value,body=+$('body').value,sm=1-(+$('smooth').value);
     let tx=(neutral.x-px)*factor,ty=(neutral.y-py)*factor;
